@@ -1,0 +1,167 @@
+periodics:
+  - name: periodic-kubernetes-containerd-conformance-test-s390x
+    labels:
+      preset-dind-enabled: "true"
+      preset-ibmcloud-cred: "true"
+    cron: "0 2/3 * * *"
+    extra_refs:
+      - base_ref: add-s390x-prov
+        org: linux-on-ibm-z
+        repo: kubetest2-plugins
+        workdir: true
+      - base_ref: master
+        org: kubernetes
+        repo: kubernetes
+    spec:
+      containers:
+        - image: gcr.io/k8s-staging-test-infra/kubekins-e2e:v20241128-8df65c072f-master
+          securityContext:
+            privileged: true
+          env:
+            - name: "BOSKOS_HOST"
+              value: "boskos.test-pods.svc.cluster.local"
+          resources:
+            requests:
+              memory: "5Gi"
+            limits:
+              memory: "5Gi"
+          command:
+            - runner.sh
+          args:
+            - bash
+            - -c
+            - |
+              set -o errexit
+              set -o nounset
+              set -o pipefail
+              set -o xtrace
+
+              export PATH=$GOPATH/bin:$PATH
+              export GO111MODULE=on
+
+              go version
+
+              make install-deployer-tf
+              TF_LATEST="v1.9.8"
+
+              RESOURCE_TYPE="vpc-service"
+              USER="periodic-k8s-containerd-conformance-job"
+
+              trap cleanup EXIT
+
+              cleanup(){
+                # stop the boskos heartbeat
+                [[ -z ${HEART_BEAT_PID:-} ]] || kill -9 "${HEART_BEAT_PID}" || true
+              }
+
+              curl -fsSL https://releases.hashicorp.com/terraform/${TF_LATEST:1}/terraform_${TF_LATEST:1}_linux_amd64.zip -o ./terraform.zip
+              unzip -o ./terraform.zip  >/dev/null 2>&1
+              rm -f ./terraform.zip
+              TF="$PWD/terraform"
+              export PATH=$PWD:$PATH
+
+              apt-get update && apt-get install -y ansible
+
+              # Details of IBM S3 storage
+              S3_SERVER=s3.eu-de.cloud-object-storage.appdomain.cloud
+              BUCKET=s390x-ci-builds
+              DIRECTORY=conformance
+
+              # Build and push artifacts to IBM COS
+              REPOROOT=../../kubernetes/kubernetes
+              kubetest2 tf --target-provider vpc --build --target-build-arch linux/s390x --repo-root $REPOROOT --stage cos://eu-de/$BUCKET/$DIRECTORY --cos-cred-type cos_hmac
+              K8S_BUILD_VERSION=`cat $REPOROOT/_output/release-stage/server/linux-s390x/kubernetes/version`
+
+              TIMESTAMP=$(date +%s)
+              jq --arg key0 'k8s-build-version' --arg value0 $K8S_BUILD_VERSION '. | .[$key0]=$value0' <<<'{}' > $ARTIFACTS/metadata.json
+              set +o errexit
+
+              heartbeat_account(){
+                count=0
+                url="http://${BOSKOS_HOST}/update?name=${BOSKOS_RESOURCE_NAME}&state=busy&owner=${USER}"
+                while [ ${count} -lt 120 ]
+                do
+                  status_code=$(curl -s -o /dev/null -w '%{http_code}' -X POST ${url})
+                  if [[ ${status_code} != 200 ]]; then
+                    echo "Heart beat to resource '${BOSKOS_RESOURCE_NAME}' failed due to invalid response, status code: ${status_code}"
+                    exit 1
+                  fi
+                  count=$(( $count + 1 ))
+                  sleep 60
+                done
+              }
+
+              if [ -n "${BOSKOS_HOST:-}" ]; then
+                set +o xtrace
+                url="http://${BOSKOS_HOST}/acquire?type=${RESOURCE_TYPE}&state=free&dest=busy&owner=${USER}"
+                output=$(curl -v -X POST ${url})
+                [ $? = 0 ] && status_code=200
+
+                if [[ ${status_code} == 200 && ${output} =~ "failed" ]]; then
+                  echo "Failed to acquire resource from Boskos of type ${RESOURCE_TYPE}"
+                  exit 1
+                elif [[ ${status_code} == 200 ]]; then
+                  export BOSKOS_RESOURCE_NAME=$(echo ${output} | jq -r '.name')
+                  export BOSKOS_REGION=$(echo ${output} | jq -r '.userdata["region"]')
+                  export BOSKOS_ZONE=$(echo ${output} | jq -r '.userdata["zone"]')
+                  rm -rf output.json
+                else
+                  echo "Failed to acquire resource due to invalid response, status code : ${status_code}"
+                  exit 1
+                fi
+
+                heartbeat_account >> "$ARTIFACTS/boskos.log" 2>&1 &
+                HEART_BEAT_PID=$(echo $!)
+              fi
+
+              echo "print variables"
+              echo ${BOSKOS_REGION}
+              echo ${BOSKOS_ZONE}
+              echo ${BOSKOS_RESOURCE_NAME}
+
+              # set -o xtrace
+              kubetest2 tf --target-provider vpc --vpc-node-image-name ibm-ubuntu-22-04-4-minimal-s390x-4 \
+                --vpc-region ${BOSKOS_REGION} --vpc-zone eu-de-1 \
+                --vpc-name ${BOSKOS_RESOURCE_NAME} \
+                --vpc-resource-group rZVPCcloudRG \
+                --vpc-ssh-key k8s-s390x-ssh-key \
+                --vpc-node-profile bz2-4x16 \
+                --ssh-private-key /etc/secret-volume/ssh-privatekey \
+                --s3-server $S3_SERVER --bucket $BUCKET  --directory $DIRECTORY \
+                --extra-vars=k8s_tar_bundles:kubernetes-server-linux-s390x.tar.gz \
+                --extra-vars=pod_subnet:10.244.0.0/16 \
+                --extra-vars=cni_provider:flannel \
+                --build-version $K8S_BUILD_VERSION \
+                --release-marker $K8S_BUILD_VERSION \
+                --cluster-name config1-$TIMESTAMP \
+                --workers-count 2 \
+                --up --auto-approve --retry-on-tf-failure 3 \
+                --break-kubetest-on-upfail true \
+                --test=ginkgo -- --parallel 10 --use-built-binaries true --focus-regex='\[Conformance\]' --skip-regex='\[Serial\]'; rc1=$?
+
+              export KUBECONFIG="$(pwd)/config1-$TIMESTAMP/kubeconfig"
+              export ARTIFACTS=$ARTIFACTS/serial_tests_artifacts
+              #Run Serial Conformance tests
+              kubetest2 tf --target-provider vpc --vpc-region ${BOSKOS_REGION} --vpc-zone eu-de-1 \
+                --ignore-cluster-dir true \
+                --cluster-name config1-$TIMESTAMP \
+                --down --auto-approve --ignore-destroy-errors \
+                --test=ginkgo -- \
+                --use-built-binaries true \
+                --focus-regex='\[Serial\].*\[Conformance\]'; rc2=$?
+              if [ $rc1 != 0 ]; then
+                  echo "ERROR: Non Serial k8s Conformance tests exited with code: $rc1"
+                  exit $rc1
+              elif [ $rc2 != 0 ]; then
+                  echo "ERROR: Serial k8s Conformance tests exited with code: $rc2"
+                  exit $rc2
+              fi
+
+              if [ -n "${BOSKOS_HOST:-}" ]; then
+                url="http://${BOSKOS_HOST}/release?name=${BOSKOS_RESOURCE_NAME}&dest=dirty&owner=${USER}"
+                status_code=$(curl -w '%{http_code}' -X POST ${url})
+                if [[ ${status_code} != 200 ]]; then
+                  echo "Failed to release resource: ${BOSKOS_RESOURCE_NAME}"
+                  exit 1
+                fi
+              fi
