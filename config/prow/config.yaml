@@ -283,3 +283,21 @@ presets:
       secret:
         defaultMode: 256
         secretName: s3-hmac-credentials
+
+- labels:
+    preset-ibmcloud-cred-z: "true"
+  volumeMounts:
+    - mountPath: /etc/secret-volume
+      name: k8s-infra-ssh-key
+      readOnly: true
+  env:
+    - name: TF_VAR_vpc_api_key
+      valueFrom:
+        secretKeyRef:
+          name: prow-job-api-key
+          key: key
+  volumes:
+    - name: k8s-infra-ssh-key
+      secret:
+        defaultMode: 256
+        secretName: k8s-infra-ssh-key
