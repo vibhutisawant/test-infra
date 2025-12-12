@@ -1,0 +1,74 @@
+periodics:
+  - name: ci-kubernetes-s390x-e2e-node-latest-kubetest2
+    cron: "30 3-21/6 * * *" #  every 6h starting at 03:30 UTC
+    cluster: k8s-infra-s390x-prow-build
+    labels:
+      preset-ibmcloud-cred: "true"
+    decorate: true
+    decoration_config:
+      timeout: 220m
+    extra_refs:
+      - base_ref: main
+        org: kubernetes-sigs
+        repo: provider-ibmcloud-test-infra
+        workdir: true
+    annotations:
+      description: Runs e2e-node tests using kubetest2 on IBM vpc
+      testgrid-dashboards: ibm-s390x-node-e2e, ibm-s390x-k8s, sig-node-s390x
+      testgrid-tab-name: ci-kubernetes-s390x-e2e-node-latest-kubetest2
+      testgrid-alert-email: sig-cloud-provider-ibm-ppc64le-alerts@kubernetes.io
+      testgrid-num-failures-to-alert: '2'
+    spec:
+      containers:
+        - image: us-central1-docker.pkg.dev/k8s-staging-test-infra/images/kubekins-e2e:v20251021-e2c2c9806f-master
+          env:
+            - name: "BOSKOS_HOST"
+              value: "boskos.test-pods.svc.cluster.local"
+            - name: "USER"
+              value: "ci-kubernetes-ppc64le-e2e-node-latest-kubetest2"
+          resources:
+            requests:
+              cpu: 2
+              memory: 10Gi
+            limits:
+              cpu: 2
+              memory: 10Gi
+          command:
+            - runner.sh
+          args:
+            - bash
+            - -c
+            - |
+              set -o xtrace
+
+              source "./hack/boskos.sh"
+
+              make install-deployer-tf
+
+              CLUSTER_NAME="config2-$(date +%s)"
+
+              set +o errexit
+              kubetest2 tf --powervs-image-name CentOS-Stream-10 --powervs-memory 32 \
+                --powervs-region ${BOSKOS_REGION} --powervs-zone ${BOSKOS_ZONE} \
+                --powervs-service-id ${BOSKOS_RESOURCE_ID} --powervs-ssh-key k8s-prow-sshkey \
+                --ssh-private-key /etc/secret-volume/ssh-privatekey \
+                --cluster-name $CLUSTER_NAME \
+                --up --set-kubeconfig=false --auto-approve --retry-on-tf-failure 3 \
+                --build-version $(curl -Ls https://dl.k8s.io/ci/latest.txt) \
+                --break-kubetest-on-upfail true \
+                --playbook k8s-node-remote.yml
+
+              EXTERNAL_IP=`grep -E '[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' $(pwd)/$CLUSTER_NAME/hosts`
+
+              # Skipping test related to https://github.com/kubernetes/kubernetes/issues/124791
+              kubetest2 tf --test=exec -- ssh -i /etc/secret-volume/ssh-privatekey root@$EXTERNAL_IP \
+                "export SKIP='\[Flaky\]|\[Slow\]|\[Serial\]|should.execute.readiness.probe.while.in.preStop' && /make-test-e2e-node.sh"; \
+                rc=$?; scp -r -i /etc/secret-volume/ssh-privatekey root@$EXTERNAL_IP:/tmp/_artifacts $ARTIFACTS
+
+              kubetest2 tf --powervs-region ${BOSKOS_REGION} --powervs-zone ${BOSKOS_ZONE} \
+                --powervs-service-id ${BOSKOS_RESOURCE_ID} \
+                --ignore-cluster-dir true \
+                --cluster-name $CLUSTER_NAME\
+                --down --auto-approve --ignore-destroy-errors
+              [ -z "${BOSKOS_HOST:-}" ] || release_account >> "$ARTIFACTS/boskos.log" 2>&1
+              [ $rc != 0 ] && echo "ERROR: E2ENode Test suite exited with code:$rc"; exit $rc
